@@ -1,0 +1,438 @@
+<?php
+
+define('COMMERCE_MLIZINGAS_REQUIRE_ADVANCE', 'mlizingas_requires_advance');
+
+/**
+ * Implements hook_menu()
+ */
+function commerce_mlizingas_menu()
+{
+    $items['commerce_mlizingas/ipn/%commerce_payment_method_instance'] = array(
+        'page callback' => 'commerce_mlizingas_process_ipn',
+        'page arguments' => array(2),
+        'access callback' => true,
+        'type' => MENU_CALLBACK,
+    );
+
+    $items['commerce_mlizingas/return/%/%'] = array(
+        'page callback' => 'commerce_mlizingas_process_return',
+        'page arguments' => array(2, 3),
+        'access callback' => true,
+        'type' => MENU_CALLBACK,
+    );
+
+    $items['test'] = array(
+        'page callback' => 'test',
+        'access callback' => true,
+    );
+
+    return $items;
+}
+
+/**
+ * Implements hook_default_message_type
+ */
+function commerce_mlizingas_default_message_type() {
+
+    $items['commerce_mlizingas_advance'] = entity_import('message_type', '{
+    "name" : "commerce_mlizingas_advance",
+    "description" : "Commerce Order: MokiLizingas status",
+    "argument_keys" : [ "@paid", "@advance" ],
+    "argument" : [],
+    "category" : "commerce_order_message",
+    "data" : { "purge" : { "override" : 0, "enabled" : 0, "quota" : "", "days" : "" } },
+    "language" : "",
+    "arguments" : null,
+    "message_order_display_name" : { "und" : [ { "value" : "Payment", "format" : null } ] },
+    "message_text" : { "und" : [
+        {
+          "value" : "<p>Paid @paid through MokiLizingas. Customer still needs to pay @advance on delivery.</p>",
+          "format" : "commerce_order_message"
+        }
+      ]
+    },
+    "rdf_mapping" : []
+  }');
+
+    return $items;
+}
+
+/**
+ * Implements hook_default_message_type_alter().
+ * Use the LANGUAGE_NONE values for the other languages in multilingual sites.
+ */
+function commerce_mlizingas_default_message_type_alter(&$items) {
+    if (module_exists('locale')) {
+        $languages = locale_language_list();
+        foreach ($languages as $langcode => $langname) {
+            foreach ($items as $message_type => $item) {
+                if ($item->module != 'commerce_mlizingas') {
+                    continue;
+                }
+                if (isset($items[$message_type]->message_text[LANGUAGE_NONE])) {
+                    $items[$message_type]->message_text[$langcode] = $items[$message_type]->message_text[LANGUAGE_NONE];
+                }
+                if (isset($items[$message_type]->message_order_display_name[LANGUAGE_NONE])) {
+                    $items[$message_type]->message_order_display_name[$langcode] = $items[$message_type]->message_order_display_name[LANGUAGE_NONE];
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Implements hook_flush_caches().
+ */
+function commerce_mlizingas_flush_caches() {
+    commerce_mlizingas_message_field_refresh();
+}
+
+function commerce_mlizingas_message_field_refresh() {
+    $fields['message_commerce_order']['field'] = array (
+        'type' => 'entityreference',
+        'module' => 'entityreference',
+        'cardinality' => '1',
+        'translatable' => FALSE,
+        'settings' => array(
+            'target_type' => 'commerce_order',
+            'handler' => 'base',
+            'handler_settings' => array(
+                'target_bundles' => array(),
+                'sort' => array(
+                    'type' => 'property',
+                    'property' => 'order_id',
+                    'direction' => 'ASC',
+                ),
+            ),
+        ),
+        'locked' => TRUE,
+    );
+    $bundles = array(
+        'commerce_mlizingas_advance',
+    );
+    $fields['message_commerce_order']['instances'][] = array(
+        'entity_type' => 'message',
+        'bundles' => $bundles,
+        'label' => 'Order',
+        'required' => TRUE,
+        'widget' => array(
+            'type' => 'entityreference_autocomplete',
+            'module' => 'entityreference',
+            'settings' => array(
+                'match_operator' => 'CONTAINS',
+                'size' => '60',
+                'path' => '',
+            ),
+        ),
+        'settings' => array(),
+        'display' => array(
+            'default' => array(
+                'label' => 'above',
+                'type' => 'entityreference_label',
+                'settings' => array(
+                    'link' => FALSE,
+                ),
+                'module' => 'entityreference',
+                'weight' => 0,
+            ),
+        ),
+    );
+
+    drupal_alter('commerce_message_message_fields', $fields);
+
+    // Create the missing fields.
+    foreach ($fields as $field_name => $info) {
+        $field = $info['field'];
+        $field += array(
+            'field_name' => $field_name,
+        );
+        if (!field_info_field($field_name)) {
+            field_create_field($field);
+        }
+
+        foreach ($info['instances'] as $instance) {
+            foreach ($instance['bundles'] as $bundle) {
+                $instance['bundle'] = $bundle;
+                unset($instance['bundles']);
+                $instance['field_name'] = $field_name;
+                if (!field_info_instance($instance['entity_type'], $instance['field_name'], $instance['bundle'])) {
+                    field_create_instance($instance);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Implements hook_commerce_order_status_info()
+ */
+function commerce_mlizingas_commerce_order_status_info() {
+    $statuses = array();
+
+    $statuses[COMMERCE_MLIZINGAS_REQUIRE_ADVANCE] = array(
+        'name' => COMMERCE_MLIZINGAS_REQUIRE_ADVANCE,
+        'state' => 'pending',
+        'title' => t('Requires advance from customer'),
+        'icon' => drupal_get_path('module', 'commerce_payment') . '/theme/icon-success.png',
+        'total' => TRUE,
+    );
+
+    return $statuses;
+}
+
+/**
+ * Process user return from mokiLizingas
+ *
+ * @param $orderId
+ * @param $paymentRedirectKey
+ * @throws Exception
+ * @throws MokilizingasException
+ */
+function commerce_mlizingas_process_return($orderId, $paymentRedirectKey)
+{
+    module_load_include('inc', 'commerce_mlizingas', 'MokiLizingas');
+
+    $order = commerce_order_load($orderId);
+    $paymentMethodInstance = commerce_payment_method_instance_load($order->data['payment_method']);
+
+    try {
+        $mLizingas = new MokiLizingas(
+            $paymentMethodInstance['settings']['username'],
+            $paymentMethodInstance['settings']['password'],
+            $paymentMethodInstance['settings']['testMode']
+        );
+
+        $mLizingasData = $mLizingas->checkPayment($_POST['session_id'], $_POST['order_id']);
+
+    } catch (MokilizingasException $e) {
+        watchdog('commerce_mlizingas_wps', $e->getMessage(), array(), WATCHDOG_ERROR);
+        throw $e;
+    }
+
+    // get transaction id by order_id and remote_id (mokilizingas session_id)
+    $result = db_query("SELECT transaction_id FROM {commerce_payment_transaction}
+        WHERE order_id = :order_id AND remote_id = :remote_id",
+        array(':order_id' => $mLizingasData->orderId, ':remote_id' => $_POST['session_id']))
+        ->fetchObject();
+
+    $transaction = commerce_payment_transaction_load($result->transaction_id);
+
+    if (
+        in_array(
+            $mLizingasData->result,
+            array(
+                'SIGNED_DEAL',
+                'SIGNED_DEAL_NO_ADVANCE',
+                'SIGNED_DEAL_YOUR_ADVANCE',
+                'SIGNED_DEAL_OFFLINE'
+            )
+        )
+    ) { // payment successful
+
+        // process payment data only if we haven't processed it already
+        if (!isset($transaction->payload[$mLizingasData->result]) || $transaction->payload[$mLizingasData->result] != $mLizingasData) {
+            $advance = (float)$mLizingasData->advance;
+
+            // check if we need to collect advance from customer
+            if ($advance > 0) {
+                // subtract advance amount in cents so we would know that user still needs to pay some money.
+                $transaction->amount = $order->commerce_order_total['und'][0]['amount'] - ($advance * 100);
+                $transaction->remote_status = $mLizingasData->result;
+                $transaction->payload[$mLizingasData->result] = $mLizingasData;
+                $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+                $transaction->message = t(
+                    'Payment was completed. Need to collect advance of @advance from customer.',
+                    array('@advance' => commerce_currency_format($advance * 100, $order->commerce_order_total['und'][0]['currency_code']))
+                );
+                commerce_payment_transaction_save($transaction);
+
+                // set custom success status, so that administrator would know that user still needs to pay advance.
+                commerce_order_status_update($order, COMMERCE_MLIZINGAS_REQUIRE_ADVANCE, false, false);
+
+                $arguments = array(
+                    '@paid' => commerce_currency_format($transaction->amount, $order->commerce_order_total['und'][0]['currency_code']),
+                    '@advance' => commerce_currency_format($advance * 100, $order->commerce_order_total['und'][0]['currency_code']),
+                );
+
+                // set message to order history.
+                $message = message_create('commerce_mlizingas_advance', array('uid' => $order->uid, 'arguments' => $arguments));
+                $wrapper = entity_metadata_wrapper('message', $message);
+                $wrapper->message_commerce_order->set($order);
+                $wrapper->save();
+
+                // redirect to success page.
+                drupal_goto('checkout/' . $orderId . '/payment/return/' . $paymentRedirectKey);
+            } else {
+                $transaction->remote_status = $mLizingasData->result;
+                $transaction->payload[$mLizingasData->result] = $mLizingasData;
+                $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+                $transaction->message = t('Payment was completed successfully.');
+                commerce_payment_transaction_save($transaction);
+
+                // No advance needed so update so set order to completed.
+                commerce_order_status_update($order, 'completed', false, false);
+
+                // redirect to success page.
+                drupal_goto('checkout/' . $orderId . '/payment/return/' . $paymentRedirectKey);
+            }
+        } else {
+            drupal_goto('checkout/' . $orderId . '/payment/return/' . $paymentRedirectKey);
+        }
+    } else if (in_array($mLizingasData->result, array('ERROR', 'NO_LOAN_POSSIBLE'))) { // Payment failure
+        if (!isset($transaction->payload[$mLizingasData->result]) || $transaction->payload[$mLizingasData->result] != $mLizingasData) {
+            $message = '';
+            if ($mLizingasData->result == 'ERROR') {
+                $message = t('MokiLizingas returned ERROR while checking loan status');
+            } else if ($mLizingasData->result == 'NO_LOAN_POSSIBLE') {
+                $message = t('Loan is not possible.');
+            }
+
+            // update transaction
+            $transaction->remote_status = $mLizingasData->result;
+            $transaction->payload[$mLizingasData->result] = $mLizingasData;
+            $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+            $transaction->message = $message;
+            commerce_payment_transaction_save($transaction);
+        }
+    } else {
+        if (!isset($transaction->payload[$mLizingasData->result]) || $transaction->payload[$mLizingasData->result] != $mLizingasData) {
+            // just update transaction remote status.
+            $transaction->remote_status = $mLizingasData->result;
+            $transaction->payload[$mLizingasData->result] = $mLizingasData;
+            commerce_payment_transaction_save($transaction);
+        }
+    }
+
+    // if status is not success redirect user to cancel URL
+    drupal_goto('checkout/' . $orderId . '/payment/back/' . $paymentRedirectKey);
+}
+
+function commerce_mlizingas_process_ipn($payment_method = NULL)
+{
+    module_load_include('inc', 'commerce_mlizingas', 'MokiLizingas');
+
+    $order = commerce_order_load($_POST['order_id']);
+
+    try {
+        $mLizingas = new MokiLizingas(
+            $payment_method['settings']['username'],
+            $payment_method['settings']['password'],
+            $payment_method['settings']['testMode']
+        );
+
+        $mLizingasData = $mLizingas->checkPayment($_POST['session_id'], $_POST['order_id']);
+
+    } catch (MokilizingasException $e) {
+        watchdog('commerce_mlizingas_wps', $e->getMessage(), array(), WATCHDOG_ERROR);
+        throw $e;
+    }
+
+    // get transaction id by order_id and remote_id (mokilizingas session_id)
+    $result = db_query("SELECT transaction_id FROM {commerce_payment_transaction}
+        WHERE order_id = :order_id AND remote_id = :remote_id",
+        array(':order_id' => $mLizingasData->orderId, ':remote_id' => $_POST['session_id']))
+        ->fetchObject();
+
+    $transaction = commerce_payment_transaction_load($result->transaction_id);
+
+    if (isset($transaction->payload[$mLizingasData->result]) && $transaction->payload[$mLizingasData->result] == $mLizingasData) {
+        return; // we already process same response so there is no need to do it twice
+    }
+
+    if (
+    in_array(
+        $mLizingasData->result,
+        array(
+            'SIGNED_DEAL',
+            'SIGNED_DEAL_NO_ADVANCE',
+            'SIGNED_DEAL_YOUR_ADVANCE',
+            'SIGNED_DEAL_OFFLINE'
+        )
+    )
+    ) { // payment successful
+
+        $advance = (float)$mLizingasData->advance;
+
+        // check if we need to collect advance from customer
+        if ($advance > 0) {
+            // subtract advance amount in cents so we would know that user still needs to pay some money.
+            $transaction->amount = $order->commerce_order_total['und'][0]['amount'] - ($advance * 100);
+            $transaction->remote_status = $mLizingasData->result;
+            $transaction->payload[$mLizingasData->result] = $mLizingasData;
+            $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+            $transaction->message = t(
+                'Payment was completed. Need to collect advance of @advance from customer.',
+                array('@advance' => commerce_currency_format($advance * 100, $order->commerce_order_total['und'][0]['currency_code']))
+            );
+            commerce_payment_transaction_save($transaction);
+
+            // set custom success status, so that administrator would know that user still needs to pay advance.
+            commerce_order_status_update($order, COMMERCE_MLIZINGAS_REQUIRE_ADVANCE, false, false);
+
+            $arguments = array(
+                '@paid' => commerce_currency_format($transaction->amount, $order->commerce_order_total['und'][0]['currency_code']),
+                '@advance' => commerce_currency_format($advance * 100, $order->commerce_order_total['und'][0]['currency_code']),
+            );
+
+            // set message to order history.
+            $message = message_create('commerce_mlizingas_advance', array('uid' => $order->uid, 'arguments' => $arguments));
+            $wrapper = entity_metadata_wrapper('message', $message);
+            $wrapper->message_commerce_order->set($order);
+            $wrapper->save();
+
+            // Move order to the next page
+            commerce_payment_redirect_pane_next_page($order);
+        } else {
+            $transaction->remote_status = $mLizingasData->result;
+            $transaction->payload[$mLizingasData->result] = $mLizingasData;
+            $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+            $transaction->message = t('Payment was completed successfully.');
+            commerce_payment_transaction_save($transaction);
+
+            // No advance needed so update so set order to completed.
+            commerce_order_status_update($order, 'completed', false, false);
+
+            // Move order to the next page
+            commerce_payment_redirect_pane_next_page($order);
+        }
+    } else if (in_array($mLizingasData->result, array('ERROR', 'NO_LOAN_POSSIBLE'))) { // Payment failure
+        $message = '';
+        if ($mLizingasData->result == 'ERROR') {
+            $message = t('MokiLizingas returned ERROR while checking loan status');
+        } else if ($mLizingasData->result == 'NO_LOAN_POSSIBLE') {
+            $message = t('Loan is not possible.');
+        }
+
+        // update transaction
+        $transaction->remote_status = $mLizingasData->result;
+        $transaction->payload[$mLizingasData->result] = $mLizingasData;
+        $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+        $transaction->message = $message;
+        commerce_payment_transaction_save($transaction);
+    } else {
+        // just update transaction remote status.
+        $transaction->remote_status = $mLizingasData->result;
+        $transaction->payload[$mLizingasData->result] = $mLizingasData;
+        commerce_payment_transaction_save($transaction);
+    }
+
+    // move order back to previous page
+    commerce_payment_redirect_pane_previous_page($order);
+}
+
+function commerce_mlizingas_commerce_checkout_pane_info()
+{
+    $checkout_panes['commerce_mlizingas'] = array(
+        'title' => '',
+        'name' => t('Completion message Advance info'),
+        'file' => 'commerce_mlizingas.checkout_pane.inc',
+        'weight' => -10,
+        'enabled' => 1,
+        'base' => 'commerce_mlizingas_pane',
+        'page' => 'complete',
+    );
+
+    return $checkout_panes;
+}
+
+
